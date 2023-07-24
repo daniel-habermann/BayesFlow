@@ -1212,6 +1212,95 @@ class TwoLevelAmortizedPosterior(tf.keras.Model, AmortizedTarget):
         return local_summaries, global_summaries
 
 
+class TwoLevelAmortizedPosterior2(tf.keras.Model, AmortizedTarget):
+
+    def __init__(self, local_amortizer, hyper_amortizer, local_summary=None, hyper_summary=None, **kwargs):
+        super().__init__(**kwargs)
+        self.local_amortizer = local_amortizer
+        self.hyper_amortizer = hyper_amortizer
+        self.local_summary = local_summary
+        self.hyper_summary = hyper_summary
+    
+    def call(self, input_dict, **kwargs):
+        local_summaries, hyper_summaries = self._compute_condition(input_dict, **kwargs)
+        local_inputs, hyper_inputs = self._prepare_inputs(input_dict, local_summaries, hyper_summaries)
+
+        local_outputs = self.local_amortizer(local_inputs, **kwargs)
+        hyper_outputs = self.hyper_amortizer(hyper_inputs, **kwargs)
+
+        
+        return local_outputs, hyper_outputs
+
+    def compute_loss(self, input_dict, **kwargs):
+        """Compute loss of all amortizers."""
+
+        local_summaries, hyper_summaries = self._compute_condition(input_dict, **kwargs)
+        local_inputs, hyper_inputs = self._prepare_inputs(input_dict, local_summaries, hyper_summaries)
+        local_loss = self.local_amortizer.compute_loss(local_inputs, **kwargs)
+        hyper_loss = self.hyper_amortizer.compute_loss(hyper_inputs, **kwargs)
+        
+        return {"Local.Loss": local_loss, "Hyper.Loss": hyper_loss}
+
+
+    def sample(self, input_dict, n_samples, to_numpy=True, **kwargs):
+        local_summaries, hyper_summaries = self._compute_condition(input_dict, **kwargs)
+        local_inputs, hyper_input = self._prepare_inputs(input_dict, local_summaries, hyper_summaries)
+         
+        local_samples = self.local_amortizer.sample(local_inputs, n_samples, to_numpy=False, **kwargs)
+
+        return local_samples
+
+
+    def log_prob(self, input_dict, **kwargs):
+        pass
+
+    def _prepare_inputs(self, input_dict, local_summaries, hyper_summaries):
+        """Prepare input dictionaries for both amortizers."""
+
+        # Prepare inputs for local amortizer
+        local_inputs = {"direct_conditions": local_summaries, "parameters": input_dict["local_parameters"]}
+
+        # Prepare inputs for hyper amortizer
+        hyper_inputs = {"direct_conditions": hyper_summaries, "parameters": input_dict["hyper_parameters"]}
+        
+        return local_inputs, hyper_inputs
+
+    
+    def _compute_condition(self, input_dict, **kwargs):
+        local_summaries = self._get_local_conditions(input_dict, **kwargs)
+        hyper_summaries = self._get_hyper_conditions(input_dict, **kwargs)
+
+        return local_summaries, hyper_summaries
+
+    def _get_local_conditions(self, input_dict, **kwargs):
+        if self.local_summary is not None:
+            local_summaries = self.local_summary(
+                input_dict["local_summary_conditions"], **kwargs
+            )
+            if input_dict["direct_local_conditions"] is not None:
+                local_summaries = tf.concat(
+                        [local_summaries, input_dict["direct_local_conditions"]], axis=-1
+                )
+        else:
+            local_summaries = input_dict.get("direct_local_conditions")
+
+
+        return local_summaries 
+    
+    def _get_hyper_conditions(self, input_dict, **kwargs):
+        if self.hyper_summary is not None:
+            hyper_summaries = self.hyper_summary(
+                input_dict["hyper_summary_conditions"], **kwargs
+            )
+            if input_dict["direct_hyper_conditions"] is not None:
+                hyper_summaries = tf.concat(
+                    [hyper_summaries, input_dict["direct_hyper_conditions"]], axis=-1
+                )
+        else:
+            hyper_summaries = input_dict.get("direct_hyper_conditions")
+
+        return hyper_summaries
+
 class SingleModelAmortizer(AmortizedPosterior):
     """Deprecated class for amortizer posterior estimation."""
 
