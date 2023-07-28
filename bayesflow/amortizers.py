@@ -1228,7 +1228,6 @@ class TwoLevelAmortizedPosterior2(tf.keras.Model, AmortizedTarget):
         local_outputs = self.local_amortizer(local_inputs, **kwargs)
         hyper_outputs = self.hyper_amortizer(hyper_inputs, **kwargs)
 
-        
         return local_outputs, hyper_outputs
 
     def compute_loss(self, input_dict, **kwargs):
@@ -1243,13 +1242,37 @@ class TwoLevelAmortizedPosterior2(tf.keras.Model, AmortizedTarget):
 
 
     def sample(self, input_dict, n_samples, to_numpy=True, **kwargs):
-        local_summaries, hyper_summaries = self._compute_condition(input_dict, **kwargs)
-        local_inputs, hyper_input = self._prepare_inputs(input_dict, local_summaries, hyper_summaries)
+        # local_summaries, hyper_summaries = self._compute_condition(input_dict, **kwargs)
          
-        local_samples = self.local_amortizer.sample(local_inputs, n_samples, to_numpy=False, **kwargs)
+        # if local_summaries.shape[0] != 1 or hyper_summaries.shape[0] != 1:
+        #     raise NotImplementedError("Method currently supports only single hierarchical data sets!")
+        
+        # local_inputs, hyper_inputs = self._prepare_inputs(input_dict, local_summaries, hyper_summaries)
+        local_inputs = {"direct_conditions": self._get_local_conditions(input_dict)}
+        local_inputs["direct_conditions"] = tf.squeeze(local_inputs["direct_conditions"], axis=0)
+        
+        # local_samples has shape (num_groups, n_samples, num_locals)
+        # transposed shape is (n_samples, num_groups, num_locals)
+        local_samples = self.local_amortizer.sample(local_inputs, n_samples, to_numpy=to_numpy, **kwargs)
+        transposed_local_samples = local_samples.transpose(1, 0, 2)
 
-        return local_samples
+        # hyper_summaries shape is (n_samples, summary_dim) 
+        hyper_summaries = self.hyper_summary(transposed_local_samples)
+        
+        # add direct conditions to hyper_summaries
+        # shape is (n_samples, summary_dim + num_direct_conditions)
+        if input_dict["direct_hyper_conditions"] is not None:
+            dim_direct_conditions = input_dict["direct_hyper_conditions"].shape[0]
+            direct_conditions_rep = tf.tile(
+                input_dict["direct_hyper_conditions"], 
+                [n_samples, dim_direct_conditions],
+            )
+            hyper_summaries = tf.concat([hyper_summaries, direct_conditions_rep], axis=1)
 
+        hyper_inputs = {"direct_conditions": hyper_summaries}
+        hyper_samples = self.hyper_amortizer.sample(hyper_inputs, 1, to_numpy=to_numpy, **kwargs)
+        
+        return {"hyper_samples": hyper_samples[:, 0, :], "local_samples": local_samples}
 
     def log_prob(self, input_dict, **kwargs):
         pass
