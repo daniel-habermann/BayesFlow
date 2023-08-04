@@ -1213,116 +1213,165 @@ class TwoLevelAmortizedPosterior(tf.keras.Model, AmortizedTarget):
 
 
 class TwoLevelAmortizedPosterior2(tf.keras.Model, AmortizedTarget):
-
-    def __init__(self, local_amortizer, hyper_amortizer, local_summary=None, hyper_summary=None, **kwargs):
+    def __init__(
+        self,
+        local_amortizer,
+        hyper_amortizer,
+        shared_amortizer=None,
+        local_summary=None,
+        hyper_summary=None,
+        shared_summary=None,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
         self.local_amortizer = local_amortizer
         self.hyper_amortizer = hyper_amortizer
+        self.shared_amortizer = shared_amortizer
         self.local_summary = local_summary
         self.hyper_summary = hyper_summary
-    
+        self.shared_summary = shared_summary
+
     def call(self, input_dict, **kwargs):
-        local_summaries, hyper_summaries = self._compute_condition(input_dict, **kwargs)
-        local_inputs, hyper_inputs = self._prepare_inputs(input_dict, local_summaries, hyper_summaries)
+        local_summaries, hyper_summaries, shared_summaries = self._compute_condition(input_dict, **kwargs)
+        local_inputs, hyper_inputs, shared_inputs = self._prepare_inputs(
+            input_dict, local_summaries, hyper_summaries, shared_summaries
+        )
 
         local_outputs = self.local_amortizer(local_inputs, **kwargs)
         hyper_outputs = self.hyper_amortizer(hyper_inputs, **kwargs)
+        shared_outputs = self.shared_amortizer(shared_inputs, **kwargs)
 
-        return local_outputs, hyper_outputs
+        return local_outputs, hyper_outputs, shared_outputs
 
     def compute_loss(self, input_dict, **kwargs):
         """Compute loss of all amortizers."""
 
-        local_summaries, hyper_summaries = self._compute_condition(input_dict, **kwargs)
-        local_inputs, hyper_inputs = self._prepare_inputs(input_dict, local_summaries, hyper_summaries)
-        local_loss = self.local_amortizer.compute_loss(local_inputs, **kwargs)
-        hyper_loss = self.hyper_amortizer.compute_loss(hyper_inputs, **kwargs)
-        
-        return {"Local.Loss": local_loss, "Hyper.Loss": hyper_loss}
+        local_summaries, hyper_summaries, shared_summaries = self._compute_condition(input_dict, **kwargs)
+        local_inputs, hyper_inputs, shared_inputs = self._prepare_inputs(
+            input_dict, local_summaries, hyper_summaries, shared_summaries)
 
+        loss_dict = {}
+
+        loss_dict["Local.Loss"] = self.local_amortizer.compute_loss(local_inputs, **kwargs)
+        loss_dict["Hyper.Loss"] = self.hyper_amortizer.compute_loss(hyper_inputs, **kwargs)
+        
+        if self.shared_amortizer is not None:
+            loss_dict["Shared.Loss"] = self.shared_amortizer.compute_loss(shared_inputs, **kwargs)
+            
+        return loss_dict 
 
     def sample(self, input_dict, n_samples, to_numpy=True, **kwargs):
-        # local_summaries, hyper_summaries = self._compute_condition(input_dict, **kwargs)
-         
-        # if local_summaries.shape[0] != 1 or hyper_summaries.shape[0] != 1:
-        #     raise NotImplementedError("Method currently supports only single hierarchical data sets!")
-        
-        # local_inputs, hyper_inputs = self._prepare_inputs(input_dict, local_summaries, hyper_summaries)
+        local_summaries, hyper_summaries, _ = self._compute_condition(input_dict, **kwargs)
+        if local_summaries.shape[0] != 1 or hyper_summaries.shape[0] != 1:
+            raise NotImplementedError("Method currently supports only single hierarchical data sets!")
+
         local_inputs = {"direct_conditions": self._get_local_conditions(input_dict)}
-        local_inputs["direct_conditions"] = tf.squeeze(local_inputs["direct_conditions"], axis=0)
-        
+        local_inputs["direct_conditions"] = tf.squeeze(local_inputs.get("direct_conditions"), axis=0)
+
         # local_samples has shape (num_groups, n_samples, num_locals)
         # transposed shape is (n_samples, num_groups, num_locals)
         local_samples = self.local_amortizer.sample(local_inputs, n_samples, to_numpy=to_numpy, **kwargs)
         transposed_local_samples = local_samples.transpose(1, 0, 2)
 
-        # hyper_summaries shape is (n_samples, summary_dim) 
+        # hyper_summaries shape is (n_samples, summary_dim)
         hyper_summaries = self.hyper_summary(transposed_local_samples)
-        
+
         # add direct conditions to hyper_summaries
         # shape is (n_samples, summary_dim + num_direct_conditions)
-        if input_dict["direct_hyper_conditions"] is not None:
+        if input_dict.get("direct_hyper_conditions") is not None:
             dim_direct_conditions = input_dict["direct_hyper_conditions"].shape[0]
             direct_conditions_rep = tf.tile(
-                input_dict["direct_hyper_conditions"], 
+                input_dict["direct_hyper_conditions"],
                 [n_samples, dim_direct_conditions],
             )
             hyper_summaries = tf.concat([hyper_summaries, direct_conditions_rep], axis=1)
 
         hyper_inputs = {"direct_conditions": hyper_summaries}
         hyper_samples = self.hyper_amortizer.sample(hyper_inputs, 1, to_numpy=to_numpy, **kwargs)
-        
-        return {"hyper_samples": hyper_samples[:, 0, :], "local_samples": local_samples}
+
+        # add direct conditions to shared_summaries
+        # shape is (n_samples, summary_dim + num_direct_conditions)
+        if input_dict.get("direct_shared_conditions") is not None:
+            dim_direct_conditions = input_dict["direct_shared_conditions"].shape[0]
+            n_groups = transposed_local_samples.shape[0]
+            direct_conditions_rep = tf.tile(
+                input_dict["direct_shared_conditions"],
+                [n_samples, n_groups, dim_direct_conditions]
+            )
+            shared_summaries = tf.concat([shared_summaries, direct_conditions_rep], axis=1)
+
+        sample_dict = {"hyper_samples": hyper_samples[:, 0, :], "local_samples": local_samples}
+
+        if self.shared_amortizer is not None:
+            shared_inputs = {"direct_conditions": shared_summaries}
+            sample_dict["shared_samples"] = self.shared_amortizer.sample(
+                shared_inputs, 1, to_numpy=to_numpy, **kwargs
+            )
+
+        return sample_dict
 
     def log_prob(self, input_dict, **kwargs):
         pass
 
-    def _prepare_inputs(self, input_dict, local_summaries, hyper_summaries):
-        """Prepare input dictionaries for both amortizers."""
+    def _prepare_inputs(self, input_dict, local_summaries, hyper_summaries, shared_summaries):
+        """Prepare input dictionaries for all three amortizers."""
 
         # Prepare inputs for local amortizer
-        local_inputs = {"direct_conditions": local_summaries, "parameters": input_dict["local_parameters"]}
+        local_inputs = {
+            "direct_conditions": local_summaries, 
+            "parameters": input_dict.get("local_parameters")
+        }
 
         # Prepare inputs for hyper amortizer
-        hyper_inputs = {"direct_conditions": hyper_summaries, "parameters": input_dict["hyper_parameters"]}
-        
-        return local_inputs, hyper_inputs
+        hyper_inputs = {
+            "direct_conditions": hyper_summaries, 
+            "parameters": input_dict.get("hyper_parameters")
+        }
 
-    
+        # Prepare inputs for shared amortizer
+        shared_inputs = {
+            "direct_conditions": shared_summaries, 
+            "parameters": input_dict.get("shared_parameters")}
+
+        return local_inputs, hyper_inputs, shared_inputs
+
     def _compute_condition(self, input_dict, **kwargs):
         local_summaries = self._get_local_conditions(input_dict, **kwargs)
         hyper_summaries = self._get_hyper_conditions(input_dict, **kwargs)
+        shared_summaries = self._get_shared_conditions(input_dict, **kwargs)
 
-        return local_summaries, hyper_summaries
+        return local_summaries, hyper_summaries, shared_summaries
 
     def _get_local_conditions(self, input_dict, **kwargs):
         if self.local_summary is not None:
-            local_summaries = self.local_summary(
-                input_dict["local_summary_conditions"], **kwargs
-            )
-            if input_dict["direct_local_conditions"] is not None:
-                local_summaries = tf.concat(
-                        [local_summaries, input_dict["direct_local_conditions"]], axis=-1
-                )
+            local_summaries = self.local_summary(input_dict.get("local_summary_conditions"), **kwargs)
+            if input_dict.get("direct_local_conditions") is not None:
+                local_summaries = tf.concat([local_summaries, input_dict["direct_local_conditions"]], axis=-1)
         else:
             local_summaries = input_dict.get("direct_local_conditions")
 
+        return local_summaries
 
-        return local_summaries 
-    
     def _get_hyper_conditions(self, input_dict, **kwargs):
         if self.hyper_summary is not None:
-            hyper_summaries = self.hyper_summary(
-                input_dict["hyper_summary_conditions"], **kwargs
-            )
-            if input_dict["direct_hyper_conditions"] is not None:
-                hyper_summaries = tf.concat(
-                    [hyper_summaries, input_dict["direct_hyper_conditions"]], axis=-1
-                )
+            hyper_summaries = self.hyper_summary(input_dict["hyper_summary_conditions"], **kwargs)
+            if input_dict.get("direct_hyper_conditions") is not None:
+                hyper_summaries = tf.concat([hyper_summaries, input_dict["direct_hyper_conditions"]], axis=-1)
         else:
             hyper_summaries = input_dict.get("direct_hyper_conditions")
 
         return hyper_summaries
+
+    def _get_shared_conditions(self, input_dict, **kwargs):
+        if self.shared_summary is not None:
+            shared_summaries = self.shared_summary(input_dict["shared_summary_conditions"], **kwargs)
+            if input_dict.get("direct_shared_conditions") is not None:
+                shared_summaries = tf.concat([shared_summaries, input_dict["direct_shared_conditions"]], axis=-1)
+        else:
+            shared_summaries = input_dict.get("direct_shared_conditions")
+
+        return shared_summaries
+
 
 class SingleModelAmortizer(AmortizedPosterior):
     """Deprecated class for amortizer posterior estimation."""
