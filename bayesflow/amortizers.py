@@ -1289,24 +1289,27 @@ class TwoLevelAmortizedPosterior2(tf.keras.Model, AmortizedTarget):
         hyper_inputs = {"direct_conditions": hyper_summaries}
         hyper_samples = self.hyper_amortizer.sample(hyper_inputs, 1, to_numpy=to_numpy, **kwargs)
 
-        # add direct conditions to shared_summaries
-        # shape is (n_samples, summary_dim + num_direct_conditions)
-        if input_dict.get("direct_shared_conditions") is not None:
-            dim_direct_conditions = input_dict["direct_shared_conditions"].shape[0]
-            n_groups = transposed_local_samples.shape[0]
-            direct_conditions_rep = tf.tile(
-                input_dict["direct_shared_conditions"],
-                [n_samples, n_groups, dim_direct_conditions]
-            )
-            shared_summaries = tf.concat([shared_summaries, direct_conditions_rep], axis=1)
-
-        sample_dict = {"hyper_samples": hyper_samples[:, 0, :], "local_samples": local_samples}
+        sample_dict = {
+            "hyper_samples": hyper_samples[:, 0, :], 
+            "local_samples": local_samples
+        }
 
         if self.shared_amortizer is not None:
+            local_summaries = self.local_summary(input_dict.get("local_summary_conditions"), **kwargs)
+            expanded_shape = (n_samples, local_summaries.shape[1], local_summaries.shape[2])
+            expanded_local_summaries = tf.broadcast_to(local_summaries, expanded_shape)
+
+            shared_summary_input = tf.concat([expanded_local_summaries, transposed_local_samples], axis=-1)
+            shared_summaries = self.shared_summary(shared_summary_input, **kwargs)
+            
+            if input_dict.get("direct_shared_conditions") is not None:
+                expanded_shape = (n_samples, input_dict["direct_shared_conditions"].shape[1])
+                shared_conditions = tf.broadcast_to(input_dict["direct_shared_conditions"], expanded_shape)
+                shared_summaries = tf.concat([shared_summaries, shared_conditions], axis=-1)
+
             shared_inputs = {"direct_conditions": shared_summaries}
-            sample_dict["shared_samples"] = self.shared_amortizer.sample(
-                shared_inputs, 1, to_numpy=to_numpy, **kwargs
-            )
+            shared_samples = self.shared_amortizer.sample(shared_inputs, 1, to_numpy=to_numpy, **kwargs)
+            sample_dict["shared_samples"] = shared_samples[:, 0, :]
 
         return sample_dict
 
@@ -1364,7 +1367,15 @@ class TwoLevelAmortizedPosterior2(tf.keras.Model, AmortizedTarget):
 
     def _get_shared_conditions(self, input_dict, **kwargs):
         if self.shared_summary is not None:
-            shared_summaries = self.shared_summary(input_dict["shared_summary_conditions"], **kwargs)
+            # for the shared summary network, we need to condition p(shared | all_data, local_params).
+            # We canuse the local_summary outputs and augment these with the local parameters.
+            # The shape of local_summary output is (num_datasets, num_groups, local_summary_dim).
+            # Augmenting with the local_parameters gives (num_datasets, num_groups, local_summary_dim + local_dim)
+            # This is then the input to the shared summary network.
+            local_summaries = self.local_summary(input_dict.get("local_summary_conditions"), **kwargs)
+            shared_summary_input = tf.concat([local_summaries, input_dict["local_parameters"]], axis=-1)
+            shared_summaries = self.shared_summary(shared_summary_input, **kwargs)
+            
             if input_dict.get("direct_shared_conditions") is not None:
                 shared_summaries = tf.concat([shared_summaries, input_dict["direct_shared_conditions"]], axis=-1)
         else:
